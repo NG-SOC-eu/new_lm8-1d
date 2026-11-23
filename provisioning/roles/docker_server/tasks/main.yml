@@ -1,0 +1,187 @@
+---
+# =============================================================================
+# role: docker_server
+# Installs Docker Engine + Compose plugin and deploys the NG-SOAR stack.
+#
+# Faithful to the NG-SOC reference `integrations` docker_server role:
+#   https://github.com/NG-SOC-eu/ng-soc-ansible/tree/integrations
+#   (Ubuntu Docker repo, SMB artefact mount, docker_login, /opt/NG-SOAR
+#    docker-compose.yml, docker_compose_v2 build: always)
+# Differences: secrets come from group_vars/all/vault.yml (not inline), and if
+# the SMB share is unreachable a bundled fallback compose file is used so the
+# training scenario still runs.
+# =============================================================================
+
+# --- Swap: absorb the memory peak of building the CACAO executor image while the
+#     NG-SOAR stack (mongo/soarca/roaster) is running, to avoid OOM (exit 137)
+#     on the small ng-soar flavor. Idempotent.
+- name: Create a 2 GiB swapfile if absent
+  ansible.builtin.shell: |
+    set -e
+    if [ ! -f /swapfile ]; then
+      fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+    fi
+    chmod 600 /swapfile
+    if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q '/swapfile'; then
+      mkswap /swapfile
+      swapon /swapfile
+      echo ENABLED
+    fi
+  args:
+    executable: /bin/bash
+  register: swap_setup
+  changed_when: "'ENABLED' in swap_setup.stdout"
+  failed_when: false
+
+- name: Persist the swapfile in /etc/fstab
+  ansible.posix.mount:
+    path: none
+    src: /swapfile
+    fstype: swap
+    opts: sw
+    state: present
+  failed_when: false
+
+- name: Bump vm.swappiness for the build
+  ansible.posix.sysctl:
+    name: vm.swappiness
+    value: "60"
+    state: present
+    reload: true
+  failed_when: false
+
+- name: Set password on the ubuntu management user
+  ansible.builtin.user:
+    name: ubuntu
+    password: "{{ ubuntu_password_hash }}"
+    update_password: always
+
+- name: Save docker-server internal (topology) IP fact
+  ansible.builtin.set_fact:
+    docker_server_internal_ip: "{{ ansible_all_ipv4_addresses | select('match', '^10\\.') | first }}"
+    cacheable: true
+
+- name: Install Docker prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - smbclient
+      - cifs-utils
+      - unzip
+    state: present
+    update_cache: true
+
+- name: Create /etc/apt/keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Download Docker GPG key (Ubuntu)
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Add Docker APT repository (Ubuntu)
+  ansible.builtin.shell: |
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  args:
+    creates: /etc/apt/sources.list.d/docker.list
+  register: repo_add
+  changed_when: repo_add.rc == 0
+
+- name: Install Docker packages
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Ensure Docker service is started and enabled
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Install Docker SDK for Python (community.docker modules)
+  ansible.builtin.pip:
+    name:
+      - docker
+      - requests
+    extra_args: "--break-system-packages"
+
+- name: Log in to Docker Hub
+  community.docker.docker_login:
+    username: "{{ dockerhub_username }}"
+    password: "{{ dockerhub_pat }}"
+  no_log: true
+  when: dockerhub_pat is defined and dockerhub_pat | length > 0
+
+# --- Artefact share (best-effort) -------------------------------------------
+- name: Create SMB mount point
+  ansible.builtin.file:
+    path: /mnt/smb_shared
+    state: directory
+    mode: "0775"
+
+- name: Mount the artefact SMB share (guest)
+  ansible.posix.mount:
+    src: "{{ smb_share_src }}"
+    path: /mnt/smb_shared
+    fstype: cifs
+    opts: "{{ smb_share_opts }}"
+    state: mounted
+  register: smb_mount
+  failed_when: false
+
+# --- NG-SOAR deployment ------------------------------------------------------
+- name: Create NG-SOAR directory for the compose file
+  ansible.builtin.file:
+    path: /opt/NG-SOAR
+    state: directory
+    mode: "0755"
+
+- name: Copy NG-SOAR compose file from the SMB share
+  ansible.builtin.copy:
+    src: /mnt/smb_shared/NG-SOAR.yml
+    dest: /opt/NG-SOAR/docker-compose.yml
+    remote_src: true
+    mode: "0644"
+  register: compose_from_smb
+  failed_when: false
+
+- name: Fall back to the bundled NG-SOAR compose file (SMB unavailable)
+  ansible.builtin.copy:
+    src: docker-compose.yml
+    dest: /opt/NG-SOAR/docker-compose.yml
+    mode: "0644"
+  when: compose_from_smb is not defined or compose_from_smb is failed
+
+- name: Ensure the KMS web root exists (bundled fallback serves toolkit here)
+  ansible.builtin.file:
+    path: /opt/NG-SOAR/kms/www
+    state: directory
+    mode: "0755"
+
+- name: Build and run NG-SOAR
+  community.docker.docker_compose_v2:
+    project_src: /opt/NG-SOAR
+    state: present
+    build: always
+  register: ng_soar_output
+
+- name: Unmount the SMB share
+  ansible.posix.mount:
+    path: /mnt/smb_shared
+    state: unmounted
+  failed_when: false
+
+- name: Show NG-SOAR deployment result
+  ansible.builtin.debug:
+    var: ng_soar_output

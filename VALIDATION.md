@@ -1,0 +1,316 @@
+# Validation Report — PUC2 Sub Case 2d
+
+Aligned with the reference sandbox
+<https://github.com/NG-SOC-eu/ng-soc-ansible/tree/integrations>.
+
+## 1. UML component → resource availability (traceability)
+
+| UML component / item | Sandbox resource | Provisioned by |
+|----------------------|------------------|----------------|
+| Hands-on Educational Platform (Cyber Range) | the CyberRangeCZ platform | `topology.yml`, `variables.yml` |
+| NG-SOAR (KMS + CACAO Validator/Executor) | host `ng-soar`: NG-SOAR stack (SMB/Docker) + CACAO Validator/Executor container | `docker_server`, `ng_soar` |
+| Lab Target Service host firewall | nftables `input` on `lab-target` (see §9) | `lab_target` |
+| NG-SOAR Operator | `soar-operator` account + console on `ng-soar` (see §10) | `ng_soar` |
+| Lab Target Service | host `lab-target` (nginx + ssh) | `lab_target` |
+| Evaluation/Reporting | host `evaluation-reporting` (ingest+summary) | `evaluation_reporting` |
+| Malicious test IP | host `attacker` (10.10.10.10) | `attacker` |
+| Cyber Range trainee console | host `student-ws` (brief, toolkit, `cacao-client`, `cr-compile`) | `student_ws` |
+| Command logging (platform) | `sandbox-logging` role + `man` syslog-ng | "set up command logging" play, `man`, `requirements.yml` |
+
+## 2. Alignment with the real infrastructure (integrations)
+
+| Item | Reference (`integrations`) | This repo | Status |
+|------|----------------------------|-----------|--------|
+| Kali image / mgmt_user | `kali` / `debian` | `kali` / `debian` | ✔ aligned |
+| Docker host | `ubuntu-noble-x86_64` / `ubuntu` / `standard.xsmedium` | idem for `ng-soar` | ✔ aligned |
+| Server/victim image | `ubuntu-noble-x86_64` / `ubuntu` | idem for target/student/eval | ✔ aligned |
+| Router image/flavor | `debian-12-x86_64` / `standard.small` | idem | ✔ aligned |
+| NG-SOAR deploy | SMB → `/opt/NG-SOAR/docker-compose.yml` → `docker_compose_v2 build:always` | same, secrets via vault + bundled fallback | ✔ aligned |
+| Docker Hub login | inline creds | `vault.yml` (same values) | ✔ aligned, externalised |
+| Command logging | `sandbox-logging` v1.0.0 + `man` syslog-ng | `requirements.yml` + logging play + `man` role | ✔ aligned |
+| Secrets | inline plaintext | centralised in `vault.yml` (+ encrypt note) | ✔ aligned, hardened |
+
+## 3. NG-SOAR (CACAO validation + execution) verified
+
+- `docker_server` deploys NG-SOAR via the reference SMB+compose pattern.
+- `ng_soar` builds the CACAO Validator/Executor (`:9100`), health-checked.
+- Validator verified functionally against the shipped files:
+
+  | Input | `approved` | Result |
+  |-------|-----------|--------|
+  | `sample_block_ip_playbook.json` | `true` | no errors |
+  | `template_block_ip.json` | `true` | placeholder source IP detected |
+  | broken playbook (no start/no block) | `false` | 4 actionable errors |
+
+  Exercises UML steps 7 (validate), 8 (result), 9 (resubmit), 10 (approval).
+
+## 4. Topology coherence
+
+- Unique names; **CIDRs disjoint** (soar `10.10.30.0/24`, attacker `10.10.10.0/24`,
+  target `10.10.20.0/24`, wan `100.100.100.0/24`). ✔
+- Routers own `.1` (subnet gateway); firewall on `.254` of each net → **no
+  collision** with reserved gateway/DHCP addresses. ✔
+- Firewall tri-homed and on the attacker→target path; static routes force the
+  data path through it → source-IP block verifiable (UML 13). ✔
+- `groups: []` + hostname targeting → **no group/host name collision**. ✔
+- Flavors/images from the reference catalogue (no unverified `standard.large`
+  or `kali-2020.4`). ✔
+
+## 5. Syntax validation results
+
+| Check | Tool | Result |
+|-------|------|--------|
+| YAML parse (all 18 `.yml`) | `python yaml.safe_load_all` | **18 ok, 0 bad** |
+| YAML lint | `yamllint` (relaxed) | PASS (1 cosmetic long-line, copied from reference) |
+| JSON validity (CACAO template + sample) | `python json.load` | **PASS** |
+| Python apps (validator, evaluation) | `python -m py_compile` | **PASS** |
+| Validator behaviour (approve/reject) | local function run | **PASS** (see §3) |
+| Stale refs (`groups['ng_soar']`, `eth2`, `/home/debian`) | grep | **none** |
+
+> `ansible-playbook --syntax-check` / `ansible-lint` cannot run in this Windows
+> shell (`WinError 87` / `No module named 'grp'` — Unix-only deps). Run on the
+> CyberRangeCZ Linux management node:
+> ```sh
+> cd provisioning
+> ansible-galaxy install -r requirements.yml
+> ansible-galaxy collection install -r requirements-collections.yml
+> ansible-playbook --syntax-check playbook.yml
+> ```
+
+## 6. Training playthrough fixes (30-level training definition)
+
+To keep every training level non-blocking on the deployed sandbox:
+
+- **Symmetric routing** (`lab_routing` role + `host_vars/*`): soar-net hosts
+  (`student-ws`, `ng-soar`, `evaluation-reporting`) get routes to both lab
+  networks via the firewall `.254`, and `attacker`/`lab-target` get a return
+  route to soar-net. Pure routing (no NAT) preserves source IPs. Routes are
+  applied immediately and persisted via the `soar-lab-routes` systemd oneshot.
+  The pre-existing attacker↔target routes are left untouched (disjoint sets).
+  Unblocks levels 6, 23 (student-ws→target) and 26 (executor→attacker probe).
+- **Detection evidence** (`~/cacao/detected_traffic.log`): lists the malicious
+  requests (`GET /admin`, `GET /.env`, port-22 scan) so level 7 (`/.env`) is
+  solvable from the workstation without touching attacker/target logs.
+- **Honest verification** (`app.py`): a failed probe SSH is now reported as
+  `inconclusive` instead of `blocked`, preventing a false `PASS` (level 29). The
+  probe prints a deterministic `BLOCKED`/`REACHABLE` token (exact for level 26).
+- **Deterministic malicious IP/port**: the APG `variables.yml` was removed. It
+  declared `malicious_source_ip` (type IP) and `target_service_port` (type port)
+  as randomized generators, and the platform injected a random IP as an extra-var
+  that overrode the fixed `10.10.10.10` from `group_vars`, so the executor blocked
+  a non-existent IP (breaking levels 24/26/29 and contradicting the student
+  artefacts). `malicious_source_ip=10.10.10.10` and `target_service_http_port=80`
+  now come solely from `group_vars/all/main.yml`. (`variant_sandboxes` is false in
+  the training definition, so no APG variant answers are needed.)
+- **Idempotent self-test**: `scenario_selftest` now retries only the non-mutating
+  readiness checks, flushes the firewall to base, runs `/execute` exactly once,
+  and always reloads the base ruleset — so no duplicate `cacao-block-*` rules
+  accumulate.
+
+### Decision — skip command logging on Kali (metasploit patch, non-blocking)
+
+`sandbox-logging` v1.0.0 pulls in `sandbox-logging-msf`, guarded by
+`when: ansible_distribution == 'Kali'` and with **no disable toggle**. Its
+`metasploit-patch.yml` runs `find / -regex '.*metasploit.*shell.rb'`, which races
+`/proc` and returns a non-zero rc, failing the deploy on the only Kali host
+(`attacker`). **Decision: skip `sandbox-logging` on Kali hosts** (now in the
+"set up command logging" play of `playbook.yml`; previously the `all` role:
+`when: ansible_distribution != 'Kali'`). Rationale: this scenario does not use
+metasploit (the attacker generates traffic with curl/nc), and the attacker is an
+automated host with no trainee-driven shell to log; all non-Kali hosts keep full
+command logging. Alternative (not taken): pin a newer `sandbox-logging` without
+the fragile `find`.
+
+### Known non-blocking issue — cacao-roaster GUI (FIX 4, low priority)
+
+The `cyentific/cacao-roaster` container (KMS/GUI on `:3000`) reports
+`unhealthy`. **Decision: left as-is, non-blocking.** Rationale: the container is
+defined in the private `NG-SOAR.yml` pulled from the artefact SMB share, **not**
+in this repo, so its healthcheck cannot be patched here; and **no training level
+uses the GUI** — the 30-level training drives the CLI/API (`cacao-client` →
+NG-SOAR `:9100`), which is healthy. Recommended fix on the artefact side:
+widen the healthcheck `start_period` (the SPA is slow to warm up) or correct its
+health endpoint. If the GUI is never needed, gate that service out of
+`NG-SOAR.yml`.
+
+## 7. Connectivity hardening (soar-net <-> lab-nets)
+
+The deploy-time self-test surfaced that `ng-soar` could reach the firewall
+(`10.10.30.254`) but not the attacker (`10.10.10.10`) — the soar-net<->lab-net
+path was incomplete. Fixes:
+
+- **No `.254` assumption** (`lab_firewall` role): the firewall now derives its
+  REAL IP on each lab network from `ansible_all_ipv4_addresses` and publishes
+  `fw_ip_soar` / `fw_ip_attacker` / `fw_ip_target` as host facts. All inter-network
+  routes (`host_vars/*`, attacker/lab_target inline routes) use those facts as the
+  next-hop, with the `.254` convention only as a fallback.
+- **Masquerade** (`lab_firewall` nftables `inet nat`): soar-net -> lab-nets traffic
+  is masqueraded at the firewall, so replies return via the firewall without
+  needing return routes on the lab hosts. The attacker->target axis
+  (`src 10.10.10.0/24`) is NOT masqueraded, so the CACAO source-IP block stays
+  fully effective.
+- **Counter-based verification** (`app.py`): UML 13 no longer depends on NG-SOAR
+  reaching the attacker over SSH. After applying the drop rule, the executor reads
+  the firewall's `cacao-block-<ip>` rule packet counter (`nft -j list ruleset`) —
+  only the firewall (on NG-SOAR's own subnet) must be reachable. `blocked` iff the
+  counter is/goes positive; `probe_output` is `BLOCKED`/`INCONCLUSIVE`. The attacker
+  now generates traffic continuously (`Restart=always`) so the counter increments.
+- **Self-test** requires only firewall reachability (attacker SSH gate removed).
+- **Diagnostics** (`net_diag` role, `run_net_diag` default true): prints interfaces,
+  routes, firewall ruleset and ping/traceroute between peers into the deploy log to
+  reveal the real firewall IPs and any remaining path break.
+
+## 8. Root-cause fix — Lab Firewall is a ROUTER (in-path enforcement)
+
+Deploy diagnostics (`net_diag`) confirmed the multi-homed `lab-firewall` **host**
+could reach each network directly but did **not forward transit** between them
+(platform port-security blocks host forwarding), so attacker→target never crossed
+it and a `forward`-chain rule could not match.
+
+**Fix (topology.yml):** `lab-firewall` is moved from `hosts` to **`routers`**,
+multi-homed at `.254` on soar/attacker/target nets. Routers are allowed to
+route/filter between subnets, so the firewall is now genuinely in the
+attacker→target path. This keeps enforcement exactly where the UML puts it
+(step 12 on the Lab Firewall, step 13 verify attacker→target) — no enforcement is
+moved to another host. The `lab_firewall` role, the `.254` static routes
+(`lab_routing`), and the executor's `nft ... inet filter forward ... drop` /
+counter verification are unchanged; they simply work now that `.254` forwards.
+Per-network `.1` routers still provide the default gateway / WAN egress.
+
+Structural checks: `lab-firewall` in `routers` (not `hosts`); three
+`router_mappings` at `.254`; all mappings reference valid nodes; names unique;
+CIDRs disjoint. ✔
+
+## 9. Definitive redesign — flat network + host-based enforcement
+
+Deploy diagnostics proved the sandbox networks are **isolated**: transit is not
+forwarded between them by a multi-homed host NOR by the per-network routers
+(attacker→target and soar→target were unreachable by every path, with the `.254`
+pin removed and the next-hop confirmed to be the `.1` router). No routing/NAT/
+firewall change can bridge them.
+
+**Redesign:**
+- **topology.yml:** one flat network `lab-net 10.10.0.0/16` with all five hosts at
+  their **unchanged** IPs (10.10.10.10 / 10.10.20.10 / 10.10.30.x) + a single
+  `lab-router` (10.10.0.1) for Internet egress. `lab-firewall` and the per-net
+  routers are removed.
+- **Enforcement (host-based):** the executor applies the block on **`lab-target`**
+  in the nftables **`input`** chain (`nft add rule inet filter input ip saddr <ip>
+  counter drop comment cacao-block-<ip>`) over direct SSH, and verifies by driving
+  the attacker at the target (`curl … && echo REACHABLE || echo BLOCKED`). All hosts
+  are directly reachable on the flat net — no firewall-in-path, no jump host.
+- Removed roles: `lab_firewall`, `lab_routing`, `net_diag`, `router_probe` (+
+  host_vars). Toolkit/brief updated to the `input` chain on `lab-target`
+  (matches the updated training JSON: L12 → `input`, L27 → `lab-target`).
+
+**Verified functionally** (local, mocked SSH): probe `BLOCKED` → `status=success`
+/ `state=blocked`; `REACHABLE` → `completed-with-warnings` / `reachable`; SSH-fail
+→ `inconclusive`; `firewall_evidence` carries `cacao-block-10.10.10.10`. The
+JSON contract (status/evidence/verification/summary) is unchanged, so all
+training gates stay exact.
+
+## 10. Conclusion
+
+All 16 UML steps are traceable to concrete resources; infrastructure choices
+(images, flavors, mgmt_user, NG-SOAR Docker deployment, command logging,
+secrets) are aligned with the real `integrations` sandbox; the topology is
+coherent with the firewall on the attacker→target path; and all YAML/JSON/Python
+assets pass local validation. Remaining checks (`--syntax-check`, live deploy)
+must run on a Linux management node.
+
+## 10. Alignment with the revised UML (training V3)
+
+The revised sequence diagram separates duties and moves two steps to the Cyber
+Range. Changes:
+
+| UML | Before | Now |
+|-----|--------|-----|
+| 4 | playbook only existed as a local file | `POST /playbooks` stores it in the NG-SOAR KMS (`draft`); NG-SOAR refuses ids that are not `playbook--<uuid-v4>` |
+| 5 | toolkit presented as served by the KMS | toolkit moved to `student_ws/files/cacao-toolkit` (delivered by the Cyber Range) |
+| 6-9 | stateless `/validate` | `POST /playbooks/submit` validates, keeps the history, status `rejected` / `ready-for-execution` |
+| 10 | - | approved playbooks are queued for the NG-SOAR Operator (`operator-notifications.log`, `soar-operator queue`) |
+| 11 | Student ran `/execute` | Student `/execute` returns **403**; only `POST /operator/execute/<id>` with `X-Operator-Token` executes, and only KMS entries in `ready-for-execution` |
+| 14 | returned only to the caller of `/execute` | `GET /playbooks/<id>/execution` for the Student |
+| 15 | NG-SOAR pushed to Evaluation | `cr-compile` (Cyber Range, timer 30 s) compiles playbook + validation results + execution logs and POSTs `/ingest` |
+
+Other fixes found while doing this:
+- the self-test used to leave a `PASS` summary in Evaluation/Reporting before the
+  trainee started; it now removes its KMS entry and its report in the `always:` block;
+- the instructor smoke-test (which contains the answers) is no longer installed on
+  `student-ws`, only on `ng-soar`;
+- the host firewall evidence is captured after the probe, so the drop counter shows
+  the match.
+
+Local checks run (Windows, services started with `python`, `jq` 1.7.1):
+`create` of the untouched template → 400; submit before create → 404; missing
+`workflow_start` / unknown `on_completion` → expected errors; approval →
+`ready-for-execution`; Student execute → HTTP 403; operator queue without token →
+403, with token → lists `source_ip 10.10.10.10`; operator execute → `executed_by:
+ng-soar-operator`, re-execute → 409; `cr-compile` → 2 artifacts before execution
+and 3 after; summary includes `compiled_artifacts`, `validation_attempts` and
+`executed_by`. The SSH block itself (`success`/`BLOCKED`/`PASS`) can only be checked
+on a deployed sandbox: the self-test asserts it there.
+
+
+## 11. First V3 deploy on CyberRangeCZ (2026-09-28)
+
+PLAY RECAP `failed=0 unreachable=0` on every node; `SELFTEST OK` (create=draft,
+submit=ready-for-execution, student execute=403, operator execute=success with
+`counter packets 12 ... drop comment "cacao-block-10.10.10.10"`, cr-compile=3
+artifacts, summary=PASS) and rollback completed. Follow-ups applied:
+- collections moved to `requirements-collections.yml`: the platform installs only
+  roles from `requirements.yml` and warned about the collections (its runner
+  already ships them);
+- the Kali libfastjson patch in the `all` role is kept on purpose (documented);
+- deploy logs (`log.txt`, `*.log`) are git-ignored.
+Access model corrected afterwards: on CyberRangeCZ people reach nodes through the
+topology GUI (**Open console** = a terminal on that node; a graphical desktop only
+when a tool needs one - none does here). The trainee therefore acts as NG-SOAR
+Operator in the `ng-soar` **console** (login `soar-operator`), not by SSH from
+student-ws: the sshd password-login block was removed, levels 2/3/24/27/28 were
+rewritten, and `soar-operator execute` no longer needs a UUID typed by hand when a
+single playbook is queued. SSH remains only as NG-SOAR's own key-based automation
+towards lab-target and the attacker (UML 12-13), which is not user access.
+To check by hand: console login of `soar-operator` on `ng-soar` (level 27).
+
+## 12. Second V3 deploy (2026-09-28) and operator-console check
+
+Second deploy after the console-access fix: `failed=0 unreachable=0 rescued=0` on
+every node, no collections warning, no sshd tasks (ng-soar `ok=88`), `SELFTEST OK`,
+rollback complete. The log could not show whether the trainee can act as NG-SOAR
+Operator in the `ng-soar` console, so the self-test now also asserts:
+- `passwd -S soar-operator` reports `P` (a usable password is set);
+- `runuser -u soar-operator -- soar-operator queue` succeeds and lists the queued
+  self-test playbook (group permission on the token + CLI);
+- the `ubuntu` (Student-equivalent) account cannot read `/etc/ng-soar/operator.token`.
+The interactive console password login itself still needs a manual check.
+
+## 13. Trainee console login on student-ws (found while recording the demo)
+
+Recording a playthrough (2026-10-11) stopped at level 3: the `student-ws` console
+asks for a password and `ubuntu` had none there (only `ng-soar` got
+`ubuntu_password_hash`, via `docker_server`), so no trainee could log in. The
+self-test never noticed because Ansible uses key-based SSH. Fix:
+- `student_ws` sets the `ubuntu` password from `ubuntu_password_hash`
+  (`qwerty!23`, the platform convention, same as `ng-soar`);
+- the self-test asserts `passwd -S ubuntu` = `P` on `student-ws`;
+- training V5 (local only) gives the login in level 3.
+
+## 14. Enforcement SSH starved by the attacker's port scan (2026-10-15)
+
+During a demo run the operator's execution failed twice with
+`kex_exchange_identification: read: Connection reset by peer` from lab-target
+port 22 (rc 255): no rule was applied, the probe stayed `REACHABLE`. NG-SOAR could
+still SSH to the attacker, so the fault was lab-target's sshd, which had been
+probed every second (`nc -z :22`) since the sandbox was deployed. Fixes:
+- attacker probes port 22 once a minute (HTTP probing unchanged);
+- lab-target raises `MaxStartups 100:30:300` and `LoginGraceTime 30`
+  (`sshd_config.d`, validated with `sshd -t`);
+- the executor retries SSH up to 3 times on rc 255 and, if lab-target stays
+  unreachable, returns `enforcement-unreachable` (skips probe and evidence)
+  instead of a misleading `completed-with-warnings`.
+
+New training runs can reuse the same sandbox and inherit the previous run's
+playbooks, reports and rules. Instructor resets added:
+`scenario-reset.sh` (ng-soar) and `student-ws-reset.sh` (student-ws).
+

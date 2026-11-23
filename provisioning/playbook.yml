@@ -1,0 +1,97 @@
+---
+# =============================================================================
+# CyberRangeCZ Sandbox Provisioning - master playbook
+# PUC2 (CYNET) - Sub Case 2d: CACAO Playbook Authoring Training
+# -----------------------------------------------------------------------------
+# Flat single-network design: the CACAO block is enforced HOST-BASED on
+# lab-target (nftables input), applied/verified directly by the NG-SOAR executor
+# over the flat network. No firewall-in-path, no inter-network routing.
+# =============================================================================
+
+# --- Baseline on every Linux host ------------------------------------------
+- name: Baseline packages and scenario markers on all hosts
+  hosts: hosts
+  become: true
+  gather_facts: true
+  roles:
+    - common
+
+# --- NG-SOAR : KMS + CACAO Validator/Executor (Docker host) ----------------
+- name: Deploy Docker engine and the NG-SOAR stack
+  hosts: ng-soar
+  become: true
+  gather_facts: true
+  roles:
+    - docker_server      # Docker + NG-SOAR via docker-compose (integrations pattern)
+    - ng_soar            # KMS content + CACAO validator/executor + toolkit/hints
+
+# --- Lab Target Service : protected service + host-based enforcement point --
+- name: Configure the Lab Target Service (web/ssh, nftables input, mgmt access)
+  hosts: lab-target
+  become: true
+  gather_facts: true
+  roles:
+    - lab_target
+
+# --- Attacker : suspicious-traffic generator (malicious test IP) -----------
+- name: Configure the Attacker host (traffic generator + verification access)
+  hosts: attacker
+  become: true
+  gather_facts: true
+  roles:
+    - attacker
+
+# --- Student workstation ----------------------------------------------------
+- name: Provision the Student workstation with CACAO authoring materials
+  hosts: student-ws
+  become: true
+  gather_facts: true
+  roles:
+    - student_ws
+
+# --- Evaluation / Reporting -------------------------------------------------
+- name: Configure the Evaluation/Reporting host
+  hosts: evaluation-reporting
+  become: true
+  gather_facts: true
+  roles:
+    - evaluation_reporting
+
+# --- Cross-cutting config on all systems (Kali rsyslog fix) ---------------
+- name: Configure all systems (host fixes)
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - all
+
+# --- LAST: deploy-time end-to-end self-test of the block path (with rollback)
+- name: Scenario self-test on NG-SOAR (asserts the host-based block path)
+  hosts: ng-soar
+  become: true
+  gather_facts: false
+  roles:
+    - scenario_selftest
+
+# --- Management node: syslog-ng forwarding (mirrors reference `man`) --------
+- name: Configure syslog-ng forwarding on the management node
+  hosts: man
+  become: true
+  gather_facts: true
+  roles:
+    - man
+
+# --- Change man syslog-ng and adding Command Logging
+- name: set up command logging
+  hosts: 
+    - routers
+    - hosts
+  roles:
+    - role: sandbox-logging
+      become: yes
+      slf_destination_port: '{% if hostvars["man"] is defined -%} 514 {%- else -%} 515 {%- endif %}'
+      # Skip Kali: sandbox-logging-msf's metasploit patch (`find /`) fails there
+      # (see VALIDATION.md, "skip command logging on Kali").
+      when:
+        - ansible_system == "Linux"
+        - ansible_distribution != 'Kali'

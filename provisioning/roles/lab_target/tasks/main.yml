@@ -1,0 +1,86 @@
+---
+# =============================================================================
+# role: lab_target
+# The protected service (HTTP + SSH) AND the host-based enforcement point:
+# the NG-SOAR executor applies an nftables `input` drop rule here (UML 12) and
+# the block is verified by driving the attacker at this service (UML 13).
+# =============================================================================
+
+- name: Install web server, ssh, nftables and sudo
+  ansible.builtin.apt:
+    name:
+      - nginx
+      - openssh-server
+      - nftables
+      - sudo
+    state: present
+    update_cache: true
+
+- name: Publish a recognizable landing page
+  ansible.builtin.copy:
+    dest: /var/www/html/index.html
+    mode: "0644"
+    content: |
+      <html><body>
+      <h1>Lab Target Service</h1>
+      <p>PUC2 Sub Case 2d - this service is the attack target.</p>
+      </body></html>
+
+- name: Ensure nginx and ssh are running
+  ansible.builtin.service:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop:
+    - nginx
+    - ssh
+
+# --- sshd: keep the management channel usable under the attacker's probes ----
+# sshd is how NG-SOAR applies the block (UML 12). The attacker also probes
+# port 22, so raise the unauthenticated-connection limits and shorten the grace
+# time, so scans cannot starve the executor ("Connection reset by peer").
+# sshd_config.d is included at the top of sshd_config, so these values win.
+- name: Raise sshd connection limits on the enforcement point
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/50-lab-target-limits.conf
+    mode: "0644"
+    content: |
+      # Managed by the lab_target role (PUC2 2d): protects NG-SOAR's management SSH.
+      MaxStartups 100:30:300
+      LoginGraceTime 30
+    validate: "/usr/sbin/sshd -t -f %s"
+  notify: restart ssh
+
+# --- Host-based firewall (nftables input chain) -----------------------------
+- name: Deploy base nftables ruleset (input policy accept)
+  ansible.builtin.copy:
+    src: nftables.conf
+    dest: /etc/nftables.conf
+    mode: "0755"
+  notify: reload nftables
+
+- name: Ensure nftables is enabled and started
+  ansible.builtin.service:
+    name: nftables
+    state: started
+    enabled: true
+
+# --- Management account the NG-SOAR executor uses to apply the block ---------
+- name: Create the NG-SOAR management user on the target
+  ansible.builtin.user:
+    name: "{{ mgmt_user }}"
+    shell: /bin/bash
+    create_home: true
+
+- name: Grant passwordless sudo limited to nft
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ mgmt_user }}"
+    mode: "0440"
+    content: "{{ mgmt_user }} ALL=(root) NOPASSWD: /usr/sbin/nft\n"
+    validate: "visudo -cf %s"
+
+- name: Authorize the NG-SOAR executor public key (from the ng-soar host fact)
+  ansible.posix.authorized_key:
+    user: "{{ mgmt_user }}"
+    state: present
+    key: "{{ hostvars['ng-soar']['soar_executor_pubkey'] | default(soar_fw_authorized_key) }}"

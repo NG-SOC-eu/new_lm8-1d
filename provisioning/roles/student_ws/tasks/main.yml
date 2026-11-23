@@ -1,0 +1,148 @@
+---
+# =============================================================================
+# role: student_ws
+# Hands-on Educational Platform (Cyber Range) trainee console:
+#   - console login for the trainee (ubuntu, password from vault.yml)
+#   - exercise brief + detection evidence            (UML 3)
+#   - templates, schema hints, firewall commands      (UML 5)
+#   - cacao-client: Student side of UML 4, 6, 9, 14, 16
+#   - cr-compile: compiles results for Evaluation     (UML 15)
+# Host image is ubuntu-noble-x86_64 (mgmt_user: ubuntu).
+# =============================================================================
+
+- name: Set the console password of the trainee account (ubuntu)
+  # The trainee logs in on the student-ws node console from the topology GUI,
+  # which asks for a password; without one the training cannot start (level 3).
+  ansible.builtin.user:
+    name: ubuntu
+    password: "{{ ubuntu_password_hash }}"
+    update_password: always
+
+- name: Install client tooling
+  ansible.builtin.apt:
+    name:
+      - curl
+      - jq
+      - uuid-runtime
+    state: present
+    update_cache: true
+
+- name: Create the trainee CACAO workspace
+  ansible.builtin.file:
+    path: /home/ubuntu/cacao
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: "0755"
+
+- name: Deliver the exercise brief (UML step 3)
+  ansible.builtin.copy:
+    src: EXERCISE_BRIEF.md
+    dest: /home/ubuntu/cacao/EXERCISE_BRIEF.md
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+
+- name: Deliver the NG-SOC detection evidence (suspicious traffic log)
+  ansible.builtin.copy:
+    src: detected_traffic.log
+    dest: /home/ubuntu/cacao/detected_traffic.log
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+
+- name: Deliver the CACAO toolkit (UML step 5 - templates, hints, supported commands)
+  ansible.builtin.copy:
+    src: cacao-toolkit/
+    dest: /home/ubuntu/cacao/
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+
+- name: Create the pristine workspace directory (instructor reset)
+  ansible.builtin.file:
+    path: /usr/local/share/cacao-training/student-ws
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Keep a pristine copy of the workspace (instructor reset)
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: /usr/local/share/cacao-training/student-ws/
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - EXERCISE_BRIEF.md
+    - detected_traffic.log
+    - cacao-toolkit/
+
+- name: Install the instructor workspace reset (student-ws)
+  ansible.builtin.copy:
+    src: student-ws-reset.sh
+    dest: /usr/local/sbin/student-ws-reset.sh
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Install the cacao-client helper
+  ansible.builtin.copy:
+    src: cacao-client.sh
+    dest: /usr/local/bin/cacao-client
+    mode: "0755"
+
+- name: Install the Cyber Range compiler (UML step 15)
+  ansible.builtin.copy:
+    src: cr-compile.sh
+    dest: /usr/local/bin/cr-compile
+    mode: "0755"
+
+- name: Point the client tools at NG-SOAR and Evaluation/Reporting
+  ansible.builtin.copy:
+    dest: /etc/profile.d/cacao-client.sh
+    mode: "0644"
+    content: |
+      export NG_SOAR_URL="http://{{ ng_soar_ip }}:9100"
+      export EVAL_URL="http://{{ evaluation_ip }}:9000"
+      export CR_PLAYBOOK="{{ cr_student_playbook }}"
+
+- name: Install the cr-compile service and timer (every 30 s)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: cr-compile.service
+      content: |
+        [Unit]
+        Description=Cyber Range: compile student results for Evaluation/Reporting (UML 15)
+        After=network-online.target
+        Wants=network-online.target
+        [Service]
+        Type=oneshot
+        User=ubuntu
+        Environment=NG_SOAR_URL=http://{{ ng_soar_ip }}:9100
+        Environment=EVAL_URL=http://{{ evaluation_ip }}:9000
+        Environment=CR_PLAYBOOK={{ cr_student_playbook }}
+        ExecStart=/usr/local/bin/cr-compile
+    - name: cr-compile.timer
+      content: |
+        [Unit]
+        Description=Run the Cyber Range compiler every 30 s (UML 15)
+        [Timer]
+        OnBootSec=60
+        OnUnitActiveSec=30
+        AccuracySec=5
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Enable the cr-compile timer
+  ansible.builtin.systemd:
+    name: cr-compile.timer
+    enabled: true
+    daemon_reload: true
+    state: started
