@@ -20,7 +20,7 @@
 #   egress for provisioning.
 # =============================================================================
 
-name: puc2-subcase2d-cacao-firewall-ip-block
+name: lm8-1d-puc2-subcase2d-cacao-firewall-ip-block
 
 # -----------------------------------------------------------------------------
 # Hosts (all on the single flat lab-net; IPs unchanged from the training docs)
